@@ -24,10 +24,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets
       # Linux software-renderer readback is intermittent (see https://github.com/speedcraft-labs/hyper/issues/258).
-      - name: Known Linux headless test: displacement silhouette
+      - name: "Known Linux headless test: displacement silhouette"
         continue-on-error: true
         run: cargo test -p texturecraft-render --test headless displacement_moves_the_silhouette_by_the_height_channel
-      - name: Known Linux headless test: idle accumulation
+      - name: "Known Linux headless test: idle accumulation"
         continue-on-error: true
         run: cargo test -p texturecraft-render --test headless idle_accumulation_converges_then_stops
       - name: Workspace tests
