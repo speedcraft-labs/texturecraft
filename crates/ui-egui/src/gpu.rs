@@ -13,6 +13,9 @@ use texturecraft_engine::core::BakedMap;
 use texturecraft_engine::geom::Mesh;
 use texturecraft_render::{Frame, Renderer, wgpu};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::gpu_composite::GpuComposite;
+
 /// Content shown through the aux texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuxView {
@@ -76,6 +79,9 @@ pub struct GpuLink {
     /// What each set's aux texture holds: (mesh map or mask key, revision).
     aux: BTreeMap<usize, (String, u64)>,
     pub adapter: String,
+    /// Native fast path for unmasked paint/fill stacks; unsupported stacks stay on the CPU.
+    #[cfg(not(target_arch = "wasm32"))]
+    compositor: Option<GpuComposite>,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
 }
@@ -123,6 +129,8 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         env: Default::default(),
         aux: BTreeMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
+        #[cfg(not(target_arch = "wasm32"))]
+        compositor: Some(GpuComposite::new(Arc::new(rs.device.clone()), Arc::new(rs.queue.clone()))),
         composite_total: 0,
     }
 }
@@ -147,6 +155,15 @@ impl GpuLink {
         let left = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = s.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(compositor) = &self.compositor {
+            s.update_for_with_accelerator(COMPOSITE_BUDGET_MS.min(left(0)).max(MIN_SLICE_MS), crate::now_ms, |inputs, out, tiles| {
+                compositor.composite(inputs, out, tiles)
+            });
+        } else {
+            s.update_for(COMPOSITE_BUDGET_MS.min(left(0)).max(MIN_SLICE_MS), crate::now_ms);
+        }
+        #[cfg(target_arch = "wasm32")]
         s.update_for(COMPOSITE_BUDGET_MS.min(left(0)).max(MIN_SLICE_MS), crate::now_ms);
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {

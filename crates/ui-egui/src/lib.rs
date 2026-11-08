@@ -14,6 +14,8 @@ pub mod docking;
 pub mod export_templates;
 pub mod fonts;
 pub mod gpu;
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_composite;
 pub mod i18n;
 pub mod keymap;
 pub mod menus;

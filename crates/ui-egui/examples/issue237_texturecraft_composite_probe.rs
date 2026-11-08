@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut run = fixture(&input)?;
     let gpu = if use_gpu {
         let headless = Headless::new().map_err(|error| format!("wgpu headless initialization failed: {error}"))?;
-        eprintln!("CRAFT_GPU_ADAPTER={}", headless.adapter_name);
+        println!("CRAFT_GPU_ADAPTER={}", headless.adapter_name);
         Some(GpuComposite::new(Arc::new(headless.device), Arc::new(headless.queue)))
     } else {
         None
@@ -144,12 +144,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("GPU fast path covered {accelerated} of {} fixture tiles", run.tiles.len()).into());
         }
         let (mean, max) = compare(&run.session, &oracle.session, &run.tiles)?;
-        eprintln!("TEXTURECRAFT_GPU_ORACLE_BOUND={ERROR_BOUND:.8} mean={mean:.8} max={max:.8}");
+        println!("TEXTURECRAFT_GPU_ORACLE_BOUND={ERROR_BOUND:.8} mean={mean:.8} max={max:.8}");
     } else {
         run.session.update_for(f64::INFINITY, || start.elapsed().as_secs_f64() * 1000.0);
     }
     let elapsed_ns = start.elapsed().as_nanos();
-    eprintln!("CRAFT_JOURNEY_NS={elapsed_ns}");
-    eprintln!("CRAFT_OUTPUT_SHA256={oracle_hash}");
+    println!("CRAFT_JOURNEY_NS={elapsed_ns}");
+    println!("CRAFT_OUTPUT_SHA256={oracle_hash}");
     Ok(())
 }
