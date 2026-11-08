@@ -678,6 +678,20 @@ impl Session {
     /// goes first; settling tiles (see [`SetCache::settle`]) get at most [`SETTLE_BUDGET_MS`]
     /// of a finite budget, after the dirty ones.
     pub fn update_for(&mut self, budget_ms: f64, clock: impl Fn() -> f64) -> bool {
+        self.update_for_with_accelerator(budget_ms, clock, |_, _, _| false)
+    }
+
+    /// [`Session::update_for`] with an optional external tile compositor. The accelerator must
+    /// return `true` only after it has written every requested tile into `out`; `false` leaves
+    /// the CPU compositor to produce the authoritative result. Accelerator output still goes
+    /// through CPU padding and upload bookkeeping. The CPU implementation remains the fallback
+    /// and oracle.
+    pub fn update_for_with_accelerator(
+        &mut self,
+        budget_ms: f64,
+        clock: impl Fn() -> f64,
+        mut accelerator: impl FnMut(&texturecraft_compose::Inputs, &mut Composite, &[(u32, u32)]) -> bool,
+    ) -> bool {
         let start = clock();
         let first = if budget_ms.is_finite() { rayon::current_num_threads().clamp(1, CHUNK) } else { CHUNK };
         // The layer being edited: everything else is cached per tile.
@@ -732,7 +746,13 @@ impl Session {
                     images: &self.images,
                     bounds: self.mesh.bounds(),
                 };
-                texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                if accelerator(&inputs, &mut cache.composite, &tiles) {
+                    // The cached layer split was built by the CPU evaluator; discard it so a
+                    // later CPU fallback cannot reuse intermediates from before the GPU pass.
+                    cache.below = BelowCache::default();
+                } else {
+                    texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                }
                 // The composited tiles and the neighbours their padding reached change.
                 let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
