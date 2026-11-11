@@ -12,6 +12,7 @@ pub mod bake_mode;
 mod bake_scene;
 mod color_selection_editor;
 pub mod control;
+mod decal_drop;
 pub mod dock;
 pub mod docking;
 pub mod export_templates;
@@ -23,6 +24,10 @@ pub mod gpu;
 pub mod i18n;
 pub mod id_color_pick;
 pub mod keymap;
+pub mod layer_panel;
+mod levels_editor;
+mod levels_handle;
+mod levels_properties;
 mod mask_preview_image;
 mod material_preview_image;
 pub mod menus;
@@ -120,6 +125,8 @@ pub struct TextureCraftApp {
     pub resize: Option<ResizeJob>,
     pub link_cooks: Vec<LinkCook>,
     pub thumbs: thumbs::Thumbs,
+    /// The Layers panel's thumbnails and folded groups.
+    pub layer_panel: layer_panel::LayerPanel,
     /// Last frame's viewport rect (logical points), for scripted input.
     pub viewport_rect: egui::Rect,
     pub fps: f32,
@@ -207,6 +214,7 @@ impl TextureCraftApp {
             resize: None,
             link_cooks: Vec::new(),
             thumbs: thumbs::Thumbs::default(),
+            layer_panel: layer_panel::LayerPanel::default(),
             viewport_rect: egui::Rect::NOTHING,
             fps: 0.0,
             ui_ms: 0.0,
