@@ -21,10 +21,12 @@ mod layers_panel;
 mod levels_editor;
 mod mask_value_swap;
 mod new_project_baked_maps;
+mod path_in_view;
 mod path_list;
 mod pen_pressure;
 mod polygon_fill;
 mod properties_popup;
+mod rail;
 mod shelf_drop;
 mod shelf_hover_preview;
 mod shift_lines_2d;
@@ -33,3 +35,5 @@ mod skew_paint;
 mod split_divider;
 mod start_window;
 mod toolbar;
+
+mod symmetry;
