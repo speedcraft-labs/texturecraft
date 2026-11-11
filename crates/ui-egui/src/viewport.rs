@@ -1,7 +1,7 @@
 //! The 3D viewport and the 2D UV view: navigation, painting input, brush cursor and the GPU
 //! callbacks that render them.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use egui::emath::GuiRounding as _;
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -16,6 +16,8 @@ use crate::TextureCraftApp;
 use crate::decal_drop::DecalDrop;
 use crate::gpu::ViewCallback;
 use crate::i18n::{tr, trf};
+use crate::path_hit::PathHit;
+use crate::path_surface_cache::{PathSurfaceCache, SurfaceCurve};
 use crate::state::ViewLayout;
 use crate::theme::Tokens;
 use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
@@ -571,11 +573,15 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
+    // A dismissing click cannot paint or place a decal through the rail popup
+    let rail_popup = crate::rail_popup::blocks_paint_input(app, ui.ctx());
+
     // Decal placement: a click moves the decal being placed there, unless it dismisses a waiting image drop's menu
     let placing = app.placing_decal.filter(|_| app.ui.mode == crate::state::Mode::Painting);
     if let Some(layer) = placing {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         if !alt
+            && !rail_popup
             && !DecalDrop::blocks_input(ui.ctx())
             && response.clicked_by(PointerButton::Primary)
             && let Some(pointer) = response.interact_pointer_pos()
@@ -587,7 +593,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, s_held || v_held);
-    let popup = app.properties_popup.is_some();
+    let popup = app.properties_popup.is_some() || rail_popup;
 
     // A pending ID color pick takes the next click instead of the brush
     let picking_id_color = app.picking_id_color.is_some();
@@ -613,6 +619,21 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && touch.is_none()
         && !DecalDrop::blocks_input(ui.ctx())
         && decal_input(app, ui, &response, rect);
+    let symmetry_drag = !alt
+        && !adjusting
+        && !s_held
+        && !v_held
+        && !focus_pick
+        && !popup
+        && placing.is_none()
+        && !picking_id_color
+        && touch.is_none()
+        && !DecalDrop::blocks_input(ui.ctx())
+        && !decal_drag
+        && crate::symmetry::manipulator_input(app, ui, &response, rect);
+
+    // A handle owns a new click, but a stroke already under way must still finish over it
+    let symmetry_handle = !app.session.stroke_active() && crate::symmetry::manipulator_hovered(app, ui, rect);
 
     // Painting
     let painting = app.ui.mode == crate::state::Mode::Painting
@@ -626,13 +647,15 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !picking_id_color
         && touch.is_none()
         && !decal_drag
+        && !symmetry_drag
+        && !symmetry_handle
         && !DecalDrop::blocks_input(ui.ctx());
     let path_tool = app.session.tool.tool == Tool::Path;
     let viewport = app.session.viewport;
     let show = |app: &TextureCraftApp, point: Vec3| project(app, rect, point);
     let mut fill_box = None;
     if painting && path_tool {
-        path_input(app, ui, &response, false, |app, pointer| app.session.pick(local(pointer), viewport).map(|hit| hit.pos), show);
+        path_input(app, ui, &response, (rect, false), |app, pointer| app.session.pick(local(pointer), viewport).map(|hit| hit.pos), show);
     } else if painting && app.session.tool.tool == Tool::PolygonFill {
         fill_box = polygon_fill_input(
             app,
@@ -683,6 +706,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         camera: app.session.camera,
         shade: Shade { highlight: drop_highlight(app, ui, &response), ..shade(app) },
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
+        overlay: crate::symmetry::scene_overlay(app, ui, rect),
     };
     add_callback(app, ui, rect, frame, sync);
     polygon_fill_box_overlay(ui, rect, fill_box);
@@ -691,16 +715,22 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View3d);
 
     // Brush cursor; while a Ctrl+drag changes the brush it stays where the drag began
+    let mut symmetry_cursor = None;
     if app.ui.mode == crate::state::Mode::Painting
         && !navigating
         && response.hovered()
         && brush_tool(app.session.tool.tool)
+        && (app.session.tool.tool != Tool::Path || adjusting)
+        && !crate::symmetry::manipulator_hovered(app, ui, rect)
         && app.picking_id_color.is_none()
         && let Some(hover_pos) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos() }
         && let Some(hit) = app.session.pick(local(hover_pos), app.session.viewport)
     {
         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
-        brush_cursor(app, ui, rect, hit.pos, hit.nrm);
+        let (bounds_min, bounds_max) = app.session.mesh.bounds();
+        let radius = app.session.tool.brush.size * (bounds_max - bounds_min).length();
+        brush_cursor(app, ui, rect, hit.pos, hit.nrm, radius);
+        symmetry_cursor = Some((hit.pos, hit.nrm));
         if app.session.tool.tool == Tool::Clone
             && let Some(source) = app.session.clone_source_point(Some(hit.uv))
         {
@@ -712,13 +742,14 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             && !path_tool
             && let Some(from) = app.last_paint_point
         {
-            rubber_band(ui, rect, pos2(rect.left() + from.x, rect.top() + from.y), hover_pos);
+            rubber_band(ui, rect, &[pos2(rect.left() + from.x, rect.top() + from.y), hover_pos]);
         }
     }
 
     if app.ui.mode == crate::state::Mode::Painting && path_tool {
         path_overlay(app, ui, rect, &response, false, show);
     }
+    crate::symmetry::overlay(app, ui, rect, symmetry_cursor);
     stencil_overlay(app, ui, rect);
     decal_overlay(app, ui, rect);
     brush_readout(app, ui, &response, adjusting);
@@ -1004,22 +1035,51 @@ fn stencil_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
     painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_white_alpha(120)), 5.0, 4.0));
 }
 
-/// A world point on screen in the 3D view `rect` (None behind the camera).
-fn project(app: &TextureCraftApp, rect: Rect, p: Vec3) -> Option<Pos2> {
-    let n = app.session.camera.project(p, rect.width() / rect.height().max(1.0))?;
-    Some(pos2(rect.left() + (n.x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - n.y * 0.5) * rect.height()))
+/// A world point on screen in the 3D view `rect` (None behind the camera)
+pub(crate) fn project(app: &TextureCraftApp, rect: Rect, point: Vec3) -> Option<Pos2> {
+    let ndc = app.session.camera.project(point, rect.width() / rect.height().max(1.0))?;
+    Some(pos2(rect.left() + (ndc.x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - ndc.y * 0.5) * rect.height()))
 }
 
-/// Control point grab radius (points).
+/// Control point and curve grab radius (points)
 const HANDLE_GRAB: f32 = 8.0;
+/// Opacity of the selected layer's other stored paths
+const PATH_STORED_OPACITY: f32 = 0.55;
+/// Opacity of a curve where the mesh hides it
+const PATH_HIDDEN_OPACITY: f32 = 0.5;
+/// A control point counts as hidden when the surface under it is this much closer (relative)
+const PATH_HIDDEN_DEPTH: f32 = 0.01;
+/// The Path tool's pointer glyph size (points)
+const PATH_CURSOR_SIZE: f32 = 18.0;
+/// A path's line and the dark outline under it (points)
+const PATH_LINE_WIDTH: f32 = 1.4;
+const PATH_OUTLINE_WIDTH: f32 = 3.0;
+/// Where the view hint sits from the view's bottom left corner, and its text size (points)
+const PATH_HINT_OFFSET: egui::Vec2 = vec2(56.0, -12.0);
+const PATH_HINT_FONT_SIZE: f32 = 12.0;
+/// The pen pointer's drop shadow, and the space before its insert plus (points)
+const PATH_CURSOR_SHADOW_OFFSET: egui::Vec2 = vec2(1.0, 1.0);
+const PATH_CURSOR_PLUS_GAP: f32 = 1.0;
+/// The insert plus beside the pen pointer, relative to the pen's size
+const PATH_CURSOR_PLUS_SCALE: f32 = 0.6;
+/// Space kept right of the view hint, and its narrowest wrap width (points)
+const PATH_HINT_MARGIN: f32 = 8.0;
+const PATH_HINT_MIN_WIDTH: f32 = 80.0;
+/// How much a control point marker grows under the pointer, and when selected (points)
+const PATH_POINT_HOVER_GROWTH: f32 = 1.5;
+const PATH_POINT_SELECTED_GROWTH: f32 = 0.5;
+/// Control point marker radius (points)
+const PATH_POINT_RADIUS: f32 = 3.0;
+/// Curve sampling step on screen (points)
+const PATH_SCREEN_STEP: f32 = 3.0;
 
-/// Path tool keys: Enter applies the path, Backspace removes its last point (Esc, handled with
-/// the global shortcuts, cancels it).
+/// Path tool keys: Enter applies the path, Backspace removes the selected (or last) point; Esc is a global shortcut
 fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
     #[cfg(not(target_arch = "wasm32"))]
     if crate::updates_ui::blocks_input(app) {
         return;
     }
+
     if app.ui.mode != crate::state::Mode::Painting
         || app.session.tool.tool != Tool::Path
         || app.session.tool.path.points.is_empty()
@@ -1027,24 +1087,116 @@ fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
     {
         return;
     }
+
     let (enter, back) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::Enter), i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)));
     if enter {
         app.run("tool.path", json!({"commit": true}));
     }
     if back {
-        app.session.tool.path.points.pop();
+        app.session.remove_selected_path_point();
     }
 }
 
-/// Path tool input in a view (`uv`: the 2D view). Pressing on a control point drags it,
-/// elsewhere adds a point (and drags it); clicking the first point of an open path closes it.
-/// `place` maps a pointer position to a path point (None off the surface), `show` a path point
-/// to the screen.
+/// The selected layer's stored paths except the edited one: (path sublayer, index, path)
+fn other_paths(app: &TextureCraftApp) -> Vec<(texturecraft_engine::core::LayerId, usize, texturecraft_engine::PathState)> {
+    let s = &app.session;
+    let Some(layer) = s.selected_layer().and_then(|id| s.doc.project.layer(id).ok()) else { return Vec::new() };
+    let effects = layer.content_effects.iter().chain(layer.mask.iter().flat_map(|m| m.effects.iter()));
+    effects
+        .flat_map(|e| s.stored_path_states(e.id).into_iter().enumerate().map(move |(i, path)| (e.id, i, path)))
+        .filter(|(e, i, _)| s.tool.path.editing != Some((*e, *i)))
+        .collect()
+}
+
+/// The screen curve through `points` per segment, each starting on its first point
+fn screen_segments(points: &[Pos2], closed: bool) -> Vec<Vec<Pos2>> {
+    let pts: Vec<Vec2> = points.iter().map(|p| Vec2::new(p.x, p.y)).collect();
+    texturecraft_engine::paint::spline_segments(&pts, closed, PATH_SCREEN_STEP)
+        .into_iter()
+        .zip(points)
+        .map(|(samples, first)| std::iter::once(*first).chain(samples.into_iter().map(|v| pos2(v.x, v.y))).collect())
+        .collect()
+}
+
+/// A path's curve in a view per segment: screen position and whether the mesh leaves it visible (None off the mesh or screen)
+type ScreenCurve = Vec<Vec<Option<(Pos2, bool)>>>;
+
+/// The nearest segment of `curve` within grab distance of `at`, with the nearest position on it
+fn segment_near(curve: &ScreenCurve, at: Pos2) -> Option<(usize, Pos2)> {
+    let nearest = |segment: &Vec<Option<(Pos2, bool)>>| {
+        segment.windows(2).filter_map(|w| Some(closest_on_line(w[0]?.0, w[1]?.0, at))).min_by(|a, b| a.distance(at).total_cmp(&b.distance(at)))
+    };
+    curve
+        .iter()
+        .enumerate()
+        .filter_map(|(i, segment)| nearest(segment).map(|p| (i, p)))
+        .filter(|(_, p)| p.distance(at) < HANDLE_GRAB)
+        .min_by(|a, b| a.1.distance(at).total_cmp(&b.1.distance(at)))
+}
+
+/// `path`'s curve in a view; a 3D curve lies where its paint lands, and without `depth_test` (hit tests) every sample counts as visible
+fn curve_on_screen(
+    app: &TextureCraftApp,
+    ui: &Ui,
+    (rect, uv, depth_test): (Rect, bool, bool),
+    path: &texturecraft_engine::PathState,
+    stored: Option<(texturecraft_engine::core::LayerId, usize)>,
+    show: &impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>,
+) -> ScreenCurve {
+    if uv {
+        let Some(points) = path.points.iter().map(|p| show(app, *p)).collect::<Option<Vec<_>>>() else { return Vec::new() };
+        return screen_segments(&points, path.closed).into_iter().map(|segment| segment.into_iter().map(|at| Some((at, true))).collect()).collect();
+    }
+    let s = &app.session;
+    let surface = stored
+        .and_then(|(eid, index)| stored_surface(app, ui, eid, index))
+        .unwrap_or_else(|| Arc::new(s.path_surface(&path.points, path.closed, s.camera, s.viewport)));
+    surface
+        .iter()
+        .map(|segment| segment.iter().map(|p| p.and_then(|p| show(app, p).map(|at| (at, !depth_test || path_point_visible(app, rect, p, at))))).collect())
+        .collect()
+}
+
+/// Sample the stored curve once while visible, invalidating it when the path or mesh changes
+fn stored_surface(app: &TextureCraftApp, ui: &Ui, eid: texturecraft_engine::core::LayerId, index: usize) -> Option<SurfaceCurve> {
+    ui.memory_mut(|memory| memory.caches.cache::<PathSurfaceCache>().get(&app.session, eid, index))
+}
+
+/// The point of the segment `a`–`b` nearest to `p`
+fn closest_on_line(a: Pos2, b: Pos2, p: Pos2) -> Pos2 {
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 { ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
+    a + ab * t
+}
+
+/// What `at` is over in a view (`uv`: the 2D view); `show` maps a path point to the screen
+fn path_hit(app: &TextureCraftApp, ui: &Ui, (rect, uv): (Rect, bool), at: Pos2, show: &impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>) -> PathHit {
+    let path = &app.session.tool.path;
+    if path.uv == uv {
+        if let Some(i) = path.points.iter().position(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB)) {
+            return PathHit::Point(i);
+        }
+        if let Some((i, on)) = segment_near(&curve_on_screen(app, ui, (rect, uv, false), path, path.editing, show), at) {
+            return PathHit::Curve(i, on);
+        }
+    }
+    for (eid, i, other) in other_paths(app) {
+        if other.uv == uv
+            && (other.points.iter().any(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB))
+                || segment_near(&curve_on_screen(app, ui, (rect, uv, false), &other, Some((eid, i)), show), at).is_some())
+        {
+            return PathHit::Stored(eid, i);
+        }
+    }
+    PathHit::Miss
+}
+
+/// Path tool presses in a view: select and drag a point, insert on the curve, open another path, close on the first point, or add a point
 fn path_input(
     app: &mut TextureCraftApp,
     ui: &Ui,
     resp: &egui::Response,
-    uv: bool,
+    (rect, uv): (Rect, bool),
     place: impl Fn(&TextureCraftApp, Pos2) -> Option<Vec3>,
     show: impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>,
 ) {
@@ -1054,71 +1206,191 @@ fn path_input(
         && let Some(at) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
     {
         let path = &app.session.tool.path;
-        let near = if path.uv == uv { path.points.iter().position(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB)) } else { None };
-        match near {
-            Some(0) if clicked && !path.closed && path.points.len() >= 3 => app.session.tool.path.closed = true,
-            Some(i) => ui.data_mut(|d| {
-                d.insert_temp(drag_id, i);
-            }),
-            None => match place(app, at) {
-                Some(p) => {
-                    app.session.tool.path.push(p, uv);
-                    let last = app.session.tool.path.points.len().saturating_sub(1);
-                    ui.data_mut(|d| {
-                        d.insert_temp(drag_id, last);
-                    });
+        let (closed, len) = (path.closed, path.points.len());
+        let hit = path_hit(app, ui, (rect, uv), at, &show);
+
+        let grab = match hit {
+            PathHit::Point(0) if clicked && !closed && len >= 3 => {
+                app.session.set_path_closed(true);
+                None
+            }
+            PathHit::Point(i) => {
+                app.session.select_path_point(i);
+                Some(i)
+            }
+            PathHit::Stored(eid, index) => {
+                app.run("path.edit", json!({"effect": eid.0, "index": index}));
+                None
+            }
+            hit => match place(app, if let PathHit::Curve(_, on) = hit { on } else { at }) {
+                Some(p) => match hit {
+                    PathHit::Curve(i, _) => app.session.insert_path_point(i + 1, p),
+                    _ => app.session.append_path_point(p, uv),
+                },
+                None => {
+                    app.toast(tr("Place path points on the mesh"), false);
+                    None
                 }
-                None => app.toast(tr("Place path points on the mesh"), false),
             },
+        };
+        if let Some(i) = grab {
+            ui.data_mut(|d| d.insert_temp(drag_id, (i, true)));
         }
     }
+
     if resp.dragged_by(PointerButton::Primary)
-        && let Some(i) = ui.data(|d| d.get_temp::<usize>(drag_id))
+        && let Some((index, begin_drag)) = ui.data(|data| data.get_temp::<(usize, bool)>(drag_id))
         && let Some(p) = resp.interact_pointer_pos().and_then(|pos| place(app, pos))
-        && let Some(q) = app.session.tool.path.points.get_mut(i)
+        && app.session.move_path_point(index, p, begin_drag)
     {
-        *q = p;
+        ui.data_mut(|data| data.insert_temp(drag_id, (index, false)));
     }
+
     if !resp.is_pointer_button_down_on() {
-        ui.data_mut(|d| d.remove::<usize>(drag_id));
+        ui.data_mut(|data| data.remove::<(usize, bool)>(drag_id));
     }
 }
 
-/// The path being edited: its curve, control points (the first one in the accent color) and,
-/// while open, a dashed preview of the next segment.
+/// Is path point `p` (on screen at `at`) in front of the mesh in the 3D view `rect`?
+fn path_point_visible(app: &TextureCraftApp, rect: Rect, p: Vec3, at: Pos2) -> bool {
+    let eye = app.session.camera.eye();
+    let local = Vec2::new(at.x - rect.left(), at.y - rect.top());
+    app.session.pick(local, app.session.viewport).is_none_or(|hit| hit.pos.distance(eye) >= p.distance(eye) * (1.0 - PATH_HIDDEN_DEPTH))
+}
+
+/// Draw `curve` in `color` over a dark outline, as a faint line where the mesh hides it
+fn draw_path_curve(painter: &egui::Painter, curve: &ScreenCurve, color: Color32) {
+    let draw = |run: &mut Vec<Pos2>, shown: bool| {
+        if run.len() > 1 {
+            // Hidden parts are a ghost line: no outline, half strength
+            if shown {
+                painter.add(egui::Shape::line(run.clone(), Stroke::new(PATH_OUTLINE_WIDTH, Color32::from_black_alpha(140))));
+            }
+            painter.add(egui::Shape::line(
+                std::mem::take(run),
+                Stroke::new(PATH_LINE_WIDTH, if shown { color } else { color.gamma_multiply(PATH_HIDDEN_OPACITY) }),
+            ));
+        }
+        run.clear();
+    };
+    for segment in curve {
+        // Runs of samples the view shows (or hides) alike, joined at the sample where that changes
+        let (mut run, mut shown) = (Vec::new(), true);
+        for sample in segment {
+            match *sample {
+                Some((at, visible)) => {
+                    if visible != shown && !run.is_empty() {
+                        run.push(at);
+                        draw(&mut run, shown);
+                    }
+                    shown = visible;
+                    run.push(at);
+                }
+                None => draw(&mut run, shown),
+            }
+        }
+        draw(&mut run, shown);
+    }
+}
+
+/// The layer's other paths (lit under the pointer), then the edited path with its points, the next segment's preview and the pen cursor
 fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Response, uv: bool, show: impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>) {
     let tk = Tokens::get(ui.ctx());
-    let p = ui.painter_at(rect);
-    let path = &app.session.tool.path;
-    let hint = tr("Path: click adds a point, drag moves it, Enter applies, Esc cancels");
-    p.text(rect.left_bottom() + vec2(56.0, -12.0), egui::Align2::LEFT_BOTTOM, hint, egui::FontId::proportional(12.0), tk.viewport_text);
-    if path.uv != uv {
-        return;
-    }
-    let handles: Vec<Pos2> = path.points.iter().filter_map(|q| show(app, *q)).collect();
-    let pts: Vec<Vec2> = handles.iter().map(|h| Vec2::new(h.x, h.y)).collect();
-    let curve: Vec<Pos2> = texturecraft_engine::paint::spline(&pts, path.closed, 3.0).into_iter().map(|v| pos2(v.x, v.y)).collect();
-    let color = if path.closed && path.fill { tk.viewport_accent } else { Color32::from_white_alpha(230) };
-    p.add(egui::Shape::line(curve.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
-    p.add(egui::Shape::line(curve, Stroke::new(1.4, color)));
+    let painter = ui.painter_at(rect);
+    let hint = tr("Path: click adds a point, click the curve inserts one, drag moves it, Enter applies, Esc cancels");
+    // Wrapped to the view: the hint is longer than a narrow split view
+    let at = rect.left_bottom() + PATH_HINT_OFFSET;
+    let wrap = (rect.right() - at.x - PATH_HINT_MARGIN).max(PATH_HINT_MIN_WIDTH);
+    let hint = painter.layout(hint.to_string(), egui::FontId::proportional(PATH_HINT_FONT_SIZE), tk.viewport_text, wrap);
+    painter.galley(at - vec2(0.0, hint.size().y), hint, tk.viewport_text);
+
     let hover = resp.hover_pos();
-    if !path.closed
-        && let (Some(last), Some(to)) = (handles.last(), hover)
-    {
-        rubber_band(ui, rect, *last, to);
+    let hit = hover.map(|at| (at, path_hit(app, ui, (rect, uv), at, &show)));
+    for (eid, i, other) in other_paths(app).iter().filter(|(_, _, other)| other.uv == uv) {
+        let curve = curve_on_screen(app, ui, (rect, uv, true), other, Some((*eid, *i)), &show);
+        // The path a click opens lights up
+        let opened = matches!(hit, Some((_, PathHit::Stored(e, n))) if (e, n) == (*eid, *i));
+        draw_path_curve(&painter, &curve, if opened { Color32::WHITE } else { Color32::WHITE.gamma_multiply(PATH_STORED_OPACITY) });
     }
-    for (i, h) in handles.iter().enumerate() {
-        let r = if hover.is_some_and(|m| m.distance(*h) < HANDLE_GRAB) { 5.5 } else { 4.0 };
-        p.circle(*h, r, if i == 0 { tk.viewport_accent } else { Color32::WHITE }, Stroke::new(1.5, Color32::from_black_alpha(180)));
+
+    let path = &app.session.tool.path;
+    if path.uv == uv {
+        draw_path_curve(&painter, &curve_on_screen(app, ui, (rect, uv, true), path, path.editing, &show), tk.viewport_accent);
+        let handles: Vec<Pos2> = path.points.iter().filter_map(|q| show(app, *q)).collect();
+        if !path.closed
+            && !handles.is_empty()
+            && let Some((to, PathHit::Miss)) = hit
+        {
+            let mut next = handles.clone();
+            next.push(to);
+            if let Some(segment) = screen_segments(&next, false).last() {
+                rubber_band(ui, rect, segment);
+            }
+        }
+
+        for (index, point) in path.points.iter().enumerate() {
+            let Some(handle) = show(app, *point) else { continue };
+
+            // Keep the point's original index when earlier points project behind the camera
+            let hovered = hover.is_some_and(|m| m.distance(handle) < HANDLE_GRAB);
+            let radius = if hovered { PATH_POINT_RADIUS + PATH_POINT_HOVER_GROWTH } else { PATH_POINT_RADIUS };
+            if path.selected == Some(index) {
+                painter.circle(handle, radius + PATH_POINT_SELECTED_GROWTH, tk.viewport_accent, Stroke::new(1.0, Color32::from_black_alpha(160)));
+            } else {
+                painter.circle(handle, radius, Color32::from_black_alpha(110), Stroke::new(1.0, Color32::from_white_alpha(if hovered { 230 } else { 150 })));
+            }
+        }
+    }
+
+    if let Some((at, hit)) = hit
+        && !ui.input(|i| i.modifiers.command)
+    {
+        if let PathHit::Curve(_, on) = hit {
+            // Where the click inserts its point
+            painter.circle(on, PATH_POINT_RADIUS, Color32::from_black_alpha(60), Stroke::new(1.0, Color32::from_white_alpha(110)));
+        }
+        path_cursor(ui, &painter, at, matches!(hit, PathHit::Curve(..)));
     }
 }
 
-/// Dashed preview of a straight segment, clipped to `rect` so an end far off screen adds no dashes.
-fn rubber_band(ui: &Ui, rect: Rect, from: Pos2, to: Pos2) {
-    let Some(visible) = visible_dashes(rect, from, to) else { return };
+/// The Path tool's pointer: a pen with its nib at `at`, and a plus when a click inserts a point
+fn path_cursor(ui: &Ui, painter: &egui::Painter, at: Pos2, insert: bool) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    let glyph = |icon: &str, size: f32, color: Color32| painter.layout_no_wrap(icon.to_string(), egui::FontId::proportional(size), color);
+    for (offset, color) in [(PATH_CURSOR_SHADOW_OFFSET, Color32::from_black_alpha(200)), (egui::Vec2::ZERO, Color32::WHITE)] {
+        // The pen's nib is the bottom left corner of the drawn glyph
+        let pen = glyph(egui_phosphor::regular::PEN_NIB, PATH_CURSOR_SIZE, color);
+        let origin = at + offset - pen.mesh_bounds.left_bottom().to_vec2();
+        let right = origin + pen.mesh_bounds.right_bottom().to_vec2();
+        painter.galley(origin, pen, color);
+        if insert {
+            let plus = glyph(egui_phosphor::regular::PLUS, PATH_CURSOR_SIZE * PATH_CURSOR_PLUS_SCALE, color);
+            painter.galley(right + vec2(PATH_CURSOR_PLUS_GAP, 0.0) - plus.mesh_bounds.left_top().to_vec2(), plus, color);
+        }
+    }
+}
+
+/// Dashed curve preview clipped segment by segment to bound offscreen dash allocation
+fn rubber_band(ui: &Ui, rect: Rect, line: &[Pos2]) {
     let painter = ui.painter_at(rect);
-    for stroke in [Stroke::new(2.5, Color32::from_black_alpha(120)), Stroke::new(1.0, Color32::from_white_alpha(200))] {
-        painter.add(egui::Shape::dashed_line(&visible, stroke, RUBBER_BAND_DASH, RUBBER_BAND_GAP));
+    let period = RUBBER_BAND_DASH + RUBBER_BAND_GAP;
+    let mut distance = 0.0;
+    for pair in line.windows(2) {
+        if let Some(visible) = visible_dashes(rect, pair[0], pair[1]) {
+            // Continue the dash pattern across sampled curve segments and clipped portions
+            let phase = (distance + pair[0].distance(visible[0])) % period;
+            for stroke in [Stroke::new(2.5, Color32::from_black_alpha(120)), Stroke::new(1.0, Color32::from_white_alpha(200))] {
+                // Draw any dash already in progress without extending behind this curve segment
+                if phase > 0.0 && phase < RUBBER_BAND_DASH {
+                    let direction = visible[1] - visible[0];
+                    let end = visible[0] + direction.normalized() * (RUBBER_BAND_DASH - phase).min(direction.length());
+                    painter.line_segment([visible[0], end], stroke);
+                }
+                let offset = if phase == 0.0 { 0.0 } else { period - phase };
+                painter.add(egui::Shape::dashed_line_with_offset(&visible, stroke, &[RUBBER_BAND_DASH], &[RUBBER_BAND_GAP], offset));
+            }
+        }
+        distance = (distance + pair[0].distance(pair[1])) % period;
     }
 }
 
@@ -1294,35 +1566,38 @@ fn adjust_brush(brush: &mut texturecraft_engine::paint::BrushSettings, right: bo
     }
 }
 
-fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, pos: Vec3, nrm: Vec3) {
-    let (lo, hi) = app.session.mesh.bounds();
-    let r = app.session.tool.brush.size * (hi - lo).length();
-    let t = nrm.any_orthonormal_vector();
-    let b = nrm.cross(t);
-    let to_screen = |p: Vec3| project(app, rect, p);
-    let mut pts = Vec::with_capacity(49);
-    for k in 0..=48 {
-        let a = k as f32 / 48.0 * std::f32::consts::TAU;
-        if let Some(s) = to_screen(pos + (t * a.cos() + b * a.sin()) * r) {
-            pts.push(s);
+pub(crate) fn brush_cursor(app: &TextureCraftApp, ui: &Ui, rect: Rect, position: Vec3, normal: Vec3, radius: f32) {
+    const CIRCLE_SEGMENTS: usize = 48;
+
+    let tangent = normal.any_orthonormal_vector();
+    let bitangent = normal.cross(tangent);
+    let to_screen = |point: Vec3| project(app, rect, point);
+    let mut outline = Vec::with_capacity(CIRCLE_SEGMENTS + 1);
+    for segment in 0..=CIRCLE_SEGMENTS {
+        let angle = segment as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
+        if let Some(screen) = to_screen(position + (tangent * angle.cos() + bitangent * angle.sin()) * radius) {
+            outline.push(screen);
         }
     }
-    let p = ui.painter_at(rect);
-    p.add(egui::Shape::line(pts.clone(), Stroke::new(2.5, Color32::from_black_alpha(140))));
-    p.add(egui::Shape::line(pts, Stroke::new(1.2, Color32::from_white_alpha(230))));
-    let h = app.session.tool.brush.hardness;
-    if h > 0.05 {
+
+    let painter = ui.painter_at(rect);
+    painter.add(egui::Shape::line(outline.clone(), Stroke::new(2.5, Color32::from_black_alpha(140))));
+    painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::from_white_alpha(230))));
+
+    let hardness = app.session.tool.brush.hardness;
+    if hardness > 0.05 {
         let mut inner = Vec::new();
-        for k in 0..=48 {
-            let a = k as f32 / 48.0 * std::f32::consts::TAU;
-            if let Some(s) = to_screen(pos + (t * a.cos() + b * a.sin()) * r * h) {
-                inner.push(s);
+        for segment in 0..=CIRCLE_SEGMENTS {
+            let angle = segment as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
+            if let Some(screen) = to_screen(position + (tangent * angle.cos() + bitangent * angle.sin()) * radius * hardness) {
+                inner.push(screen);
             }
         }
-        p.add(egui::Shape::dashed_line(&inner, Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
+        painter.add(egui::Shape::dashed_line(&inner, Stroke::new(1.0, Color32::from_white_alpha(120)), 3.0, 3.0));
     }
-    if let Some(c) = to_screen(pos) {
-        p.circle_filled(c, 1.5, Color32::WHITE);
+
+    if let Some(center) = to_screen(position) {
+        painter.circle_filled(center, 1.5, Color32::WHITE);
     }
 }
 
@@ -1435,6 +1710,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Painting in UV space
     let painting = app.ui.mode == crate::state::Mode::Painting
         && app.properties_popup.is_none()
+        && !crate::rail_popup::blocks_paint_input(app, ui.ctx())
         && !alt
         && !adjusting
         && !v_held
@@ -1442,7 +1718,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !DecalDrop::blocks_input(ui.ctx());
     let mut fill_box = None;
     if painting && path_tool {
-        path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
+        path_input(app, ui, &response, (rect, true), |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
     } else if painting && app.session.tool.tool == Tool::PolygonFill {
         fill_box = polygon_fill_input(
             app,
@@ -1466,6 +1742,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         camera: app.session.camera,
         shade: shade(app),
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
+        overlay: Vec::new(),
     };
     add_callback(app, ui, rect, frame, sync);
     polygon_fill_box_overlay(ui, rect, fill_box);
@@ -1508,7 +1785,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && let Some(from) = app.last_paint_uv.and_then(|point| point.uv_for(&app.session))
         && let Some(hover) = response.hover_pos()
     {
-        rubber_band(ui, rect, to_screen(from.x, from.y), hover);
+        rubber_band(ui, rect, &[to_screen(from.x, from.y), hover]);
     }
 
     if app.ui.mode == crate::state::Mode::Baking {
@@ -1622,6 +1899,60 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_surfaces_release_after_a_frame_without_paths() {
+        use texturecraft_engine::{core::EffectKind, execute, geom::primitives};
+
+        let mut session = Session::new_project("Path cache", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 256).unwrap();
+        session.viewport = Vec2::splat(400.0);
+        session.camera.yaw = 0.0;
+        session.camera.pitch = 0.0;
+        let result = execute(&mut session, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+        let effect = texturecraft_engine::core::LayerId(result["committed"]["effect"].as_u64().unwrap());
+        let EffectKind::Path(paths) = &mut session.doc.project.effect_mut(effect).unwrap().kind else { panic!("path effect") };
+        paths.resize(8, paths[0].clone());
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let context = egui::Context::default();
+        let mut previous = Vec::<std::sync::Weak<Vec<Vec<Option<Vec3>>>>>::new();
+
+        // Every path in the selection stays warm, and leaving it releases every sampled buffer
+        for _ in 0..4 {
+            let output = context.run_ui(Default::default(), |ui| {
+                for index in 0..8 {
+                    let surface = stored_surface(harness.state(), ui, effect, index).unwrap();
+                    assert!(surface.iter().map(Vec::len).sum::<usize>() > 10);
+                    if let Some(cached) = previous.get(index) {
+                        assert!(Arc::ptr_eq(&cached.upgrade().unwrap(), &surface), "unchanged paths must not be resampled");
+                    } else {
+                        previous.push(Arc::downgrade(&surface));
+                    }
+                }
+            });
+
+            // This cache lifecycle test has no renderer to consume texture updates
+            output.drop_without_applying_deltas();
+        }
+
+        let EffectKind::Path(paths) = &mut harness.state_mut().session.doc.project.effect_mut(effect).unwrap().kind else { panic!("path effect") };
+        for path in paths {
+            path.viewport = [800.0, 800.0];
+        }
+        let output = context.run_ui(Default::default(), |ui| {
+            for (index, previous) in previous.iter_mut().enumerate() {
+                let surface = stored_surface(harness.state(), ui, effect, index).unwrap();
+                assert!(previous.upgrade().is_none(), "editing a path releases its obsolete samples");
+                *previous = Arc::downgrade(&surface);
+            }
+        });
+        output.drop_without_applying_deltas();
+
+        for _ in 0..2 {
+            context.run_pass(Default::default(), |_| {}).drop_without_applying_deltas();
+        }
+
+        assert!(previous.iter().all(|surface| surface.upgrade().is_none()), "unused path surfaces must be freed while the window stays open");
+    }
 
     /// A selected mask decal on the ball, with another texture set available for selection tests
     fn decal_frame_app(render: bool) -> egui_kittest::Harness<'static, TextureCraftApp> {
