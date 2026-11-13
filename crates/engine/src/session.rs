@@ -61,16 +61,13 @@ impl SetCache {
         let dilation = DilationMap::in_blocks(&gbuf.coverage_mask(), w, h, Some(DISPLAY_PADDING), ts.block_resolution());
         let covered = covered_tiles(&gbuf);
         let all: BTreeSet<(u32, u32)> = texturecraft_compose::all_tiles(w, h).into_iter().collect();
-        let dirty = covered.iter().copied().collect();
         SetCache {
             size: (w, h),
             gbuf: Arc::new(gbuf),
             dilation: Arc::new(dilation),
             covered_tiles: Arc::new(covered),
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
-            // Composites are sampled only at covered texels (or dilation sources, which are
-            // covered too). Uncovered tiles read as channel defaults without being evaluated.
-            dirty,
+            dirty: all.clone(),
             settle: BTreeSet::new(),
             upload: all,
             revision: 0,
