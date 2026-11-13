@@ -45,10 +45,7 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let Some(rx) = app.control.as_ref() else { return };
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
-        if (r.method.starts_with("ui.") && r.method != "ui.focus") || r.method == "viewport.screenshot" {
-            // Keep control requests working while the window stays behind the user's app.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
-        }
+        raise_for_control_request(app.raise_without_focus, ctx, &r.method);
         if r.method == "ui.screenshot" {
             // Replies when the next frame has been captured.
             let reply = r.reply;
@@ -68,6 +65,22 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
         let _ = r.reply.send(reply);
         ctx.request_repaint();
     }
+}
+
+/// Make the UI pass run for a control request without taking the user's keyboard focus.
+fn raise_for_control_request(raise_without_focus: Option<fn() -> bool>, ctx: &egui::Context, method: &str) {
+    if !((method.starts_with("ui.") && method != "ui.focus") || method == "viewport.screenshot") {
+        return;
+    }
+    // An agent window starts below normal windows; restore its level before raising it in front.
+    #[cfg(target_os = "macos")]
+    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::Normal));
+    if let Some(raise) = raise_without_focus {
+        raise();
+    }
+    // A hidden native window still needs a real UI pass for widget state/geometry.
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+    ctx.request_repaint();
 }
 
 pub(crate) fn encode_png(w: u32, h: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
@@ -215,4 +228,49 @@ pub fn screenshot(app: &TextureCraftApp, view: u64) -> Option<(u32, u32, Vec<u8>
     let gpu = renderer.callback_resources.get::<crate::gpu::GpuState>()?;
     let (w, h, rgba) = gpu.renderer.read_view(&rs.device, &rs.queue, view)?;
     encode_png(w, h, rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static RAISES: AtomicUsize = AtomicUsize::new(0);
+
+    fn raise_without_focus() -> bool {
+        RAISES.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn commands_for(method: &str) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| raise_for_control_request(Some(raise_without_focus), ui.ctx(), method));
+        let commands = output.viewport_output.remove(&egui::ViewportId::ROOT).map(|root| root.commands).unwrap_or_default();
+        output.textures_delta.clear();
+        commands
+    }
+
+    #[test]
+    fn ui_requests_and_screenshots_raise_without_focus_but_ui_focus_stays_explicit() {
+        RAISES.store(0, Ordering::SeqCst);
+        let commands = commands_for("ui.inspect");
+        assert_eq!(RAISES.load(Ordering::SeqCst), 1);
+        assert!(commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
+        #[cfg(target_os = "macos")]
+        assert!(commands.contains(&egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::Normal)));
+
+        let commands = commands_for("ui.screenshot");
+        assert_eq!(RAISES.load(Ordering::SeqCst), 2);
+        assert!(commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
+
+        let commands = commands_for("viewport.screenshot");
+        assert_eq!(RAISES.load(Ordering::SeqCst), 3);
+        assert!(commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
+
+        let commands = commands_for("ui.focus");
+        assert_eq!(RAISES.load(Ordering::SeqCst), 3);
+        assert!(!commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
+        #[cfg(target_os = "macos")]
+        assert!(!commands.contains(&egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::Normal)));
+    }
 }

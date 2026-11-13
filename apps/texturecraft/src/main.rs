@@ -8,6 +8,8 @@
 mod control_server;
 mod gpu;
 mod window_frame;
+#[cfg(target_os = "macos")]
+mod window_raise;
 
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::titlebar::TitleBar;
@@ -261,6 +263,10 @@ fn main() {
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
             app.title_bar = title_bar;
+            #[cfg(target_os = "macos")]
+            if agent {
+                app.raise_without_focus = Some(window_raise::raise_without_focus);
+            }
             app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
             if let Some(port) = control {
