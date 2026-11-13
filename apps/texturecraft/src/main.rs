@@ -156,11 +156,11 @@ enum StartupSample {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StartupProjectToken(usize);
+struct StartupProjectToken(u64);
 
 fn startup_project_token(session: &Session) -> StartupProjectToken {
-    // The allocation changes on switch_to, while camera/view changes leave the document in place.
-    StartupProjectToken(session.doc.project.texture_sets.as_ptr() as usize)
+    // Session::project_id changes when a project is opened or created, but not on view changes.
+    StartupProjectToken(session.project_id)
 }
 
 fn startup_sample_can_replace(session: &Session, project_token: StartupProjectToken) -> bool {
