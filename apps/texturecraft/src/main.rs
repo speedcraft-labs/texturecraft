@@ -8,8 +8,6 @@
 mod control_server;
 mod gpu;
 mod window_frame;
-#[cfg(target_os = "macos")]
-mod window_raise;
 
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::titlebar::TitleBar;
@@ -235,6 +233,11 @@ fn main() {
     let mut options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
     // Started for an agent (`--control`): open without taking the user's keyboard focus.
     options.viewport = options.viewport.with_active(!agent);
+    // Keep an agent window behind normal application windows, even when eframe first shows it.
+    #[cfg(target_os = "macos")]
+    if agent {
+        options.viewport = options.viewport.with_window_level(egui::viewport::WindowLevel::AlwaysOnBottom);
+    }
     options.event_loop_builder = agent_event_loop(agent);
     if let Err(e) = gpu::configure(&mut options, args.gpu, args.power_pref) {
         fatal(&e.to_string(), true);
@@ -257,10 +260,6 @@ fn main() {
             }
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
-            #[cfg(target_os = "macos")]
-            if agent {
-                app.raise_without_focus = Some(window_raise::raise_without_focus);
-            }
             app.title_bar = title_bar;
             app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
