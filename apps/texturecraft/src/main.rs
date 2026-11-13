@@ -93,12 +93,7 @@ fn initial_session(args: &Args) -> (Session, bool) {
     if !args.empty {
         let session = Session::new_project("Material Ball", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048);
         return match session {
-            Ok(mut session) => {
-                // A distinct initial revision lets the deferred bake notice a project switch,
-                // since switch_to adopts the new session's revision.
-                session.revision = 0;
-                (session, true)
-            }
+            Ok(session) => (session, true),
             Err(e) => {
                 eprintln!("texturecraft: {e}");
                 std::process::exit(1);
@@ -155,9 +150,21 @@ struct Shell {
 
 enum StartupSample {
     None,
-    WaitForFirstFrame,
-    StartAfterFirstFrame,
-    Baking { receiver: std::sync::mpsc::Receiver<Result<Session, String>>, revision: u64 },
+    WaitForFirstFrame { project_token: StartupProjectToken },
+    StartAfterFirstFrame { project_token: StartupProjectToken },
+    Baking { receiver: std::sync::mpsc::Receiver<Result<Session, String>>, project_token: StartupProjectToken },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartupProjectToken(usize);
+
+fn startup_project_token(session: &Session) -> StartupProjectToken {
+    // The allocation changes on switch_to, while camera/view changes leave the document in place.
+    StartupProjectToken(session.doc.project.texture_sets.as_ptr() as usize)
+}
+
+fn startup_sample_can_replace(session: &Session, project_token: StartupProjectToken) -> bool {
+    startup_project_token(session) == project_token && session.path.is_none() && !session.modified
 }
 
 impl eframe::App for Shell {
@@ -179,8 +186,11 @@ impl eframe::App for Shell {
 
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         match &mut self.startup_sample {
-            StartupSample::WaitForFirstFrame => self.startup_sample = StartupSample::StartAfterFirstFrame,
-            StartupSample::StartAfterFirstFrame => {
+            StartupSample::WaitForFirstFrame { project_token } => {
+                self.startup_sample = StartupSample::StartAfterFirstFrame { project_token: *project_token };
+            }
+            StartupSample::StartAfterFirstFrame { project_token } => {
+                let project_token = *project_token;
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let spawned = std::thread::Builder::new().name("texturecraft-startup-sample".into()).spawn(move || {
                     let _ = sender.send(texturecraft_engine::sample_session_cpu(2048, 512).map_err(|error| error.to_string()));
@@ -189,15 +199,23 @@ impl eframe::App for Shell {
                     self.app.toast(format!("could not start the sample bake: {error}"), true);
                     self.startup_sample = StartupSample::None;
                 } else {
-                    let revision = self.app.session.revision;
-                    self.startup_sample = StartupSample::Baking { receiver, revision };
+                    self.startup_sample = StartupSample::Baking { receiver, project_token };
                 }
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
-            StartupSample::Baking { receiver, revision } => match receiver.try_recv() {
+            StartupSample::Baking { receiver, project_token } => match receiver.try_recv() {
                 Ok(Ok(session)) => {
-                    if self.app.session.revision == *revision && !self.app.session.modified {
+                    if startup_sample_can_replace(&self.app.session, *project_token) {
+                        let revision = self.app.session.revision;
+                        let camera = self.app.session.camera;
+                        let active_set = self.app.session.active_set;
+                        let view = self.app.session.view;
+                        let tool = self.app.session.tool.clone();
                         self.app.session.switch_to(session);
+                        self.app.session.camera = camera;
+                        self.app.session.active_set = active_set.min(self.app.session.set_count().saturating_sub(1));
+                        self.app.session.view = view;
+                        self.app.session.tool = tool;
                         self.app.session.revision = revision.wrapping_add(1);
                     }
                     self.startup_sample = StartupSample::None;
@@ -291,6 +309,8 @@ fn main() {
             }
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
+            let startup_sample =
+                if defer_sample { StartupSample::WaitForFirstFrame { project_token: startup_project_token(&app.session) } } else { StartupSample::None };
             app.title_bar = title_bar;
             app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
@@ -300,7 +320,7 @@ fn main() {
             Ok(Box::new(Shell {
                 app,
                 window_frame,
-                startup_sample: if defer_sample { StartupSample::WaitForFirstFrame } else { StartupSample::None },
+                startup_sample,
                 #[cfg(target_os = "macos")]
                 movable: None,
             }))
@@ -345,6 +365,25 @@ fn fatal(msg: &str, dialog: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_sample_survives_view_changes_but_not_project_switches_or_edits() {
+        let mut session =
+            Session::new_project("Material Ball", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
+        let token = startup_project_token(&session);
+        session.revision = session.revision.wrapping_add(1);
+        session.camera.yaw += 0.2;
+        session.view = texturecraft_engine::ViewMode::UvChecker;
+        assert!(startup_sample_can_replace(&session, token));
+
+        let replacement =
+            Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 2048).unwrap();
+        session.switch_to(replacement);
+        assert!(!startup_sample_can_replace(&session, token));
+
+        session.modified = true;
+        assert!(!startup_sample_can_replace(&session, startup_project_token(&session)));
+    }
 
     #[test]
     fn parses_gpu_and_power_preference_args() {
