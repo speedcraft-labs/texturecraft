@@ -45,12 +45,9 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let Some(rx) = app.control.as_ref() else { return };
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
-        if r.method.starts_with("ui.") && r.method != "ui.focus" {
-            // UI requests need a rendered pass, but must not activate the app for an agent.
-            if let Some(raise_without_focus) = app.raise_without_focus {
-                raise_without_focus();
-                ctx.request_repaint();
-            }
+        if (r.method.starts_with("ui.") && r.method != "ui.focus") || r.method == "viewport.screenshot" {
+            // Keep control requests working while the window stays behind the user's app.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         }
         if r.method == "ui.screenshot" {
             // Replies when the next frame has been captured.
@@ -97,6 +94,8 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
         }
         "ui.focus" => {
             // Explicit request: activate the app and take keyboard focus.
+            #[cfg(target_os = "macos")]
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::viewport::WindowLevel::Normal));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             ok(Value::Null)
         }
