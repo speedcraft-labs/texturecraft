@@ -11,6 +11,7 @@
 //! - `ui.set {...}`: merge fields into the UI state (e.g. `{"layout":"Only3D"}`).
 //! - `viewport.screenshot {view?: "3d"|"2d"}`: PNG of a viewport, base64.
 //! - `ui.screenshot`: PNG of the whole window (replies after the next frame).
+//! - `ui.focus`: explicitly activate the window and take keyboard focus.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -44,6 +45,13 @@ pub fn poll(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let Some(rx) = app.control.as_ref() else { return };
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
+        if r.method.starts_with("ui.") && r.method != "ui.focus" {
+            // UI requests need a rendered pass, but must not activate the app for an agent.
+            if let Some(raise_without_focus) = app.raise_without_focus {
+                raise_without_focus();
+                ctx.request_repaint();
+            }
+        }
         if r.method == "ui.screenshot" {
             // Replies when the next frame has been captured.
             let reply = r.reply;
@@ -86,6 +94,11 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
                 }
                 _ => err("`width` and `height` (points, 640..7680) are required"),
             }
+        }
+        "ui.focus" => {
+            // Explicit request: activate the app and take keyboard focus.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ok(Value::Null)
         }
         "debug.frames" => ok(app.profiler.report()),
         "debug.paintTest" => match crate::profile::start_paint_test(app, p) {

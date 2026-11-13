@@ -8,6 +8,8 @@
 mod control_server;
 mod gpu;
 mod window_frame;
+#[cfg(target_os = "macos")]
+mod window_raise;
 
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::titlebar::TitleBar;
@@ -175,6 +177,20 @@ fn checks_for_updates_at_start(control: Option<u16>) -> bool {
     control.is_none()
 }
 
+/// Driven by an agent (`--control`): don't activate the app on launch, so the user's keyboard
+/// focus stays where it is (macOS; winit activates ignoring other apps by default).
+fn agent_event_loop(agent: bool) -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(target_os = "macos")]
+    if agent {
+        return Some(Box::new(|b| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            b.with_activate_ignoring_other_apps(false);
+        }));
+    }
+    let _ = agent;
+    None
+}
+
 fn main() {
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
@@ -214,12 +230,16 @@ fn main() {
         viewport = viewport.with_icon(i);
     }
     let viewport = title_bar.viewport(viewport);
+    let control = args.control;
+    let agent = control.is_some();
     let mut options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, persistence_path, ..Default::default() };
+    // Started for an agent (`--control`): open without taking the user's keyboard focus.
+    options.viewport = options.viewport.with_active(!agent);
+    options.event_loop_builder = agent_event_loop(agent);
     if let Err(e) = gpu::configure(&mut options, args.gpu, args.power_pref) {
         fatal(&e.to_string(), true);
         std::process::exit(2);
     }
-    let control = args.control;
     // The start window offers new, open and recent projects, unless a file was given or a script drives the app
     let start = args.file.is_none() && control.is_none();
     let r = eframe::run_native(
@@ -237,6 +257,10 @@ fn main() {
             }
             let window_frame = window_frame::service(cc, matches!(title_bar, TitleBar::App(_)));
             let mut app = TextureCraftApp::new(cc, session);
+            #[cfg(target_os = "macos")]
+            if agent {
+                app.raise_without_focus = Some(window_raise::raise_without_focus);
+            }
             app.title_bar = title_bar;
             app.ui.windows.start = start && app.ui.prefs.start_window;
             app.set_startup_update_check(checks_for_updates_at_start(control));
