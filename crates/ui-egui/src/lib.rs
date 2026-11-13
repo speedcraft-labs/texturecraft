@@ -122,6 +122,8 @@ pub struct TextureCraftApp {
     ui_store: ui_state_store::UiStateStore,
     pub gpu: Option<gpu::GpuLink>,
     pub control: Option<std::sync::mpsc::Receiver<ControlRequest>>,
+    /// Order the window forward for agent-driven UI requests without activating the app (macOS).
+    pub raise_without_focus: Option<fn() -> bool>,
     pub toasts: Vec<Toast>,
     /// Texture sets the GPU could not hold, and the text of the one sticky toast naming them.
     pub(crate) gpu_memory: (Vec<String>, Option<String>),
@@ -213,6 +215,7 @@ impl TextureCraftApp {
             ui_store,
             gpu,
             control: None,
+            raise_without_focus: None,
             toasts: Vec::new(),
             gpu_memory: (Vec::new(), None),
             bake: None,
