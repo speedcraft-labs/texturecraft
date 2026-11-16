@@ -118,6 +118,48 @@ fn glb_two_materials_mirrored_node() {
     m.validate().unwrap();
 }
 
+/// A scene without a `nodes` array is legal glTF (Blender writes one for a scene with no exported
+/// objects); it must not stop the default scene from importing.
+#[test]
+fn gltf_scene_without_nodes_imports_the_default_scene() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let im = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    // Only an empty scene: nothing to import, but a clear error rather than a parse failure.
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }]);
+    json["scene"] = 0.into();
+    let err = import_mesh_bytes("scene.gltf", &serde_json::to_vec(&json).unwrap()).unwrap_err();
+    assert!(!err.to_string().contains("missing field"), "{err}");
+}
+
+#[test]
+fn glb_scene_without_nodes_keeps_binary_mesh_in_default_scene() {
+    let original = glb(true, true);
+    let jlen = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&original[20..20 + jlen]).unwrap();
+    json["scenes"] = serde_json::json!([{ "name": "EmptyReviewScene" }, { "nodes": [0] }]);
+    json["scene"] = 1.into();
+    let mut js = serde_json::to_vec(&json).unwrap();
+    while !js.len().is_multiple_of(4) {
+        js.push(b' ');
+    }
+    let bin_chunk = &original[20 + jlen..];
+    let mut glb = Vec::new();
+    glb.extend(b"glTF");
+    glb.extend(2u32.to_le_bytes());
+    glb.extend(((20 + js.len() + bin_chunk.len()) as u32).to_le_bytes());
+    glb.extend((js.len() as u32).to_le_bytes());
+    glb.extend(b"JSON");
+    glb.extend(js);
+    glb.extend(bin_chunk);
+    let im = import_mesh_bytes("scene.glb", &glb).unwrap();
+    assert_eq!(im.report.triangles, 2);
+    assert_eq!(im.mesh.materials, ["Red", "Material_1"]);
+    assert_outward(&im.mesh);
+}
+
 #[test]
 fn gltf_embedded_buffers_and_missing_attributes() {
     let im = import_mesh_bytes("scene.gltf", &embedded_gltf()).unwrap();
@@ -370,6 +412,43 @@ fn stl_ascii_and_binary() {
     let mut b = stl_binary();
     b[..5].copy_from_slice(b"solid");
     assert_eq!(import_mesh_bytes("c.stl", &b).unwrap().mesh.triangle_count(), 2);
+}
+
+#[test]
+fn stl_shared_reader_keeps_flat_normals_and_surfaces_shared_repairs_and_colors() {
+    let mut bytes = stl_binary();
+    // VisCAM/SolidView: bit 15 marks a facet color; red occupies bits 10..14.
+    bytes[132..134].copy_from_slice(&0xfc00u16.to_le_bytes());
+    // A third facet repeats that color after an uncolored facet. The shared reader groups its
+    // parts by color, so the adapter must restore the source facet order.
+    bytes.extend([0.0f32; 3].iter().flat_map(|v| v.to_le_bytes()));
+    for v in [[0.0f32, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]] {
+        bytes.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+    }
+    bytes.extend(0xfc00u16.to_le_bytes());
+    // Some exporters leave the header count at zero despite having facets.
+    bytes[80..84].copy_from_slice(&0u32.to_le_bytes());
+    let imported = import_mesh_bytes("colored.stl", &bytes).unwrap();
+    assert_eq!(imported.mesh.triangle_count(), 3);
+    assert_eq!(imported.mesh.submeshes.len(), 1);
+    assert_eq!(imported.mesh.submeshes[0].name, "colored");
+    assert_eq!(
+        imported.mesh.positions,
+        vec![
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0)
+        ]
+    );
+    assert_eq!(imported.mesh.normals, vec![Vec3::Z; 9]);
+    assert!(imported.mesh.colors.iter().any(|c| c.x > 0.99 && c.y < 0.01 && c.z < 0.01));
+    assert!(imported.report.warnings.iter().any(|w| w.contains("counts no facets")));
 }
 
 /// Every prefix and some corruptions of a valid file: errors, never panics (and never an

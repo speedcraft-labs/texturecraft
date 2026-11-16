@@ -6,7 +6,7 @@ use texturecraft_core::Channel;
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{Alignment, BrushAlpha, MAX_RADIAL_COPIES, alphas};
 
-use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_param, f32p, strp, vec3};
+use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_of, color_param, f32p, strp, vec3};
 use crate::fill_hit_test::FillHitTest;
 use crate::fill_mode::FillMode;
 use crate::session::{CloneFrom, CloneSource, StackTarget, Tool};
@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("tool.polygonFill", "Polygon fill", ["Tools"], Some("4"), "{}", always, |s, _| set_tool(s, Tool::PolygonFill)),
         cmd!("tool.smudge", "Smudge", ["Tools"], Some("5"), "{}", always, |s, _| set_tool(s, Tool::Smudge)),
         cmd!("tool.clone", "Clone", ["Tools"], Some("6"), "{}", always, |s, _| set_tool(s, Tool::Clone)),
-        cmd!("tool.colorPicker", "Color picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
+        cmd!("tool.colorPicker", "Material picker", ["Tools"], Some("P"), "{}", always, |s, _| set_tool(s, Tool::ColorPicker)),
         cmd!(
             "tool.geometryMask",
             "Geometry mask",
@@ -105,7 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Tool click",
             [],
             None,
-            "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
+            "{x, y, viewport?: [w,h]} — polygon fill / material picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
             always,
             click
         ),
@@ -115,6 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
 
 pub(crate) fn set_tool(session: &mut Session, tool: Tool) -> Result<Value> {
     session.cancel_stroke();
+
     // A box fill under way keeps what it filled as one undo step
     session.end_polygon_fill_box();
     session.tool.tool = tool;
@@ -285,11 +286,14 @@ pub(crate) fn brush_json(session: &Session) -> Value {
 }
 
 fn material(s: &mut Session, p: &Value) -> Result<Value> {
+    let channel = channel_param("tool.material", p, "channel")?;
+    let color = color_param("tool.material", p, "color")?;
+    let value = color_param("tool.material", p, "value")?;
     if let Some(v) = f32p(p, "maskValue") {
         s.tool.mask_value = v.clamp(0.0, 1.0);
     }
-    if let Some(c) = channel_param("tool.material", p, "channel")? {
-        if let Some(v) = color_param(p, "color").or_else(|| color_param(p, "value")) {
+    if let Some(c) = channel {
+        if let Some(v) = color.or(value) {
             let v = if c == Channel::Height { v.map(|x| x.clamp(-1.0, 1.0)) } else { v.map(|x| x.clamp(0.0, 1.0)) };
             s.tool.values.insert(c, v);
             s.tool.enabled.insert(c);
@@ -339,50 +343,53 @@ fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "maskValue": session.tool.mask_value }))
 }
 
-fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
-    if boolp(p, "clear") == Some(true) {
-        s.tool.stencil = None;
+fn stencil(session: &mut Session, params: &Value) -> Result<Value> {
+    if boolp(params, "clear") == Some(true) {
+        session.tool.stencil = None;
         return Ok(Value::Null);
     }
-    if let Some(name) = strp(p, "image") {
-        if !s.doc.resources.contains_key(name) {
+
+    if let Some(name) = strp(params, "image") {
+        if !session.doc.resources.contains_key(name) {
             return Err(bad("tool.stencil", format!("no resource `{name}` (import it first)")));
         }
-        let keep = s.tool.stencil.take();
-        let mut st = crate::session::StencilState::new(name);
-        if let Some(k) = keep {
-            st = crate::session::StencilState { image: name.to_string(), ..k };
+
+        let previous_stencil = session.tool.stencil.take();
+        let mut stencil_state = crate::session::StencilState::new(name);
+        if let Some(previous_stencil) = previous_stencil {
+            stencil_state = crate::session::StencilState { image: name.to_string(), ..previous_stencil };
         }
-        s.tool.stencil = Some(st);
+        session.tool.stencil = Some(stencil_state);
     }
-    let st = s.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
-    if let Some(c) = color_param(p, "center").map(|c| [c[0], c[1]]).or_else(|| pair(p, "center")) {
-        st.center = c.map(|v| v.clamp(-4.0, 4.0));
+
+    let stencil_state = session.tool.stencil.as_mut().ok_or_else(|| bad("tool.stencil", "no stencil: give `image`"))?;
+    if let Some(center) = pair(params, "center").or_else(|| params.get("center").and_then(color_of).map(|color| [color[0], color[1]])) {
+        stencil_state.center = center.map(|value| value.clamp(-4.0, 4.0));
     }
-    if let Some(v) = f32p(p, "scale") {
-        st.scale = v.clamp(0.01, 10.0);
+    if let Some(scale) = f32p(params, "scale") {
+        stencil_state.scale = scale.clamp(0.01, 10.0);
     }
-    if let Some(v) = f32p(p, "rotation") {
-        st.rotation = v.rem_euclid(360.0);
+    if let Some(rotation) = f32p(params, "rotation") {
+        stencil_state.rotation = rotation.rem_euclid(360.0);
     }
-    if let Some(v) = boolp(p, "tile") {
-        st.tile = v;
+    if let Some(tile) = boolp(params, "tile") {
+        stencil_state.tile = tile;
     }
-    if let Some(v) = f32p(p, "opacity") {
-        st.opacity = v.clamp(0.0, 1.0);
+    if let Some(opacity) = f32p(params, "opacity") {
+        stencil_state.opacity = opacity.clamp(0.0, 1.0);
     }
-    s.revision = s.revision.wrapping_add(1);
-    Ok(serde_json::to_value(&s.tool.stencil).unwrap_or(Value::Null))
+
+    session.revision = session.revision.wrapping_add(1);
+    Ok(serde_json::to_value(&session.tool.stencil).unwrap_or(Value::Null))
 }
 
 /// A `[a, b]` param of two finite numbers.
 fn pair(p: &Value, key: &str) -> Option<[f32; 2]> {
     let a = p.get(key)?.as_array()?;
-    let v: Vec<f32> = a.iter().filter_map(Value::as_f64).map(|x| x as f32).filter(|x| x.is_finite()).collect();
-    match v.as_slice() {
-        [x, y] => Some([*x, *y]),
-        _ => None,
-    }
+    let [x, y] = a.as_slice() else { return None };
+    let x = x.as_f64()? as f32;
+    let y = y.as_f64()? as f32;
+    (x.is_finite() && y.is_finite()).then_some([x, y])
 }
 
 fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {

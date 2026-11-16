@@ -83,6 +83,15 @@ fn round_trip_is_identical_and_deterministic() {
 }
 
 #[test]
+fn shared_project_schema_round_trips_the_app_document() {
+    let project = sample().pf.project;
+    let original = serde_json::to_value(&project).unwrap();
+    let document: craft_tcraft::ProjectDocument = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(document.format_version, project.format_version);
+    assert_eq!(serde_json::to_value(document).unwrap(), original);
+}
+
+#[test]
 fn legacy_bakes_load_as_is_without_layout_conversion() {
     let mut sample = sample();
     sample.pf.project.format_version = 1;
@@ -803,13 +812,17 @@ fn baked_dimensions_must_match_the_entry_before_reserving_payload_bytes() {
 #[test]
 fn streamed_float_chunks_preserve_bits_across_the_chunk_boundary() {
     let values: Vec<u32> = (0..BAKED_CHUNK + 3).map(|index| (index as u32).wrapping_mul(0x9e3779b9)).collect();
-    let bytes: Vec<u8> = values.iter().flat_map(|bits| bits.to_le_bytes()).collect();
+    let mut bytes = header(values.len() as u32, 1, 1, 0);
+    bytes.extend(values.iter().flat_map(|bits| bits.to_le_bytes()));
+    let declared = bytes.len() as u64;
     let mut reader = Cursor::new(bytes);
+    let mut budget = LoadBudget::new(declared);
 
-    let decoded = read_f32s(&mut reader, values.len(), "baked map").unwrap();
+    let (_, _, decoded) = read_baked(&mut reader, declared, 1, &mut budget, "baked map").unwrap();
 
     assert_eq!(decoded.into_iter().map(f32::to_bits).collect::<Vec<_>>(), values);
-    assert_eq!(reader.position(), (values.len() * 4) as u64);
+    assert_eq!(reader.position(), declared);
+    assert_eq!(budget.remaining(), 0);
 }
 
 #[test]
@@ -818,23 +831,19 @@ fn archive_indexing_does_not_scan_large_payloads_and_rejects_large_metadata() {
     writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
     writer.write_all(&vec![7; 1 << 20]).unwrap();
     let bytes = writer.finish().unwrap().into_inner();
-    let metadata_only = Cell::new(true);
 
-    let mut archive = open_archive(Cursor::new(bytes), &metadata_only, 4096).unwrap();
+    let mut archive = open_archive(Cursor::new(bytes), 4096).unwrap();
     let mut first_byte = [0; 1];
     archive.by_index(0).unwrap().read_exact(&mut first_byte).unwrap();
 
     assert_eq!(first_byte, [7]);
-    assert!(!metadata_only.get());
 
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     writer.start_file("a".repeat(5000), SimpleFileOptions::default()).unwrap();
     writer.write_all(&[7]).unwrap();
     let bytes = writer.finish().unwrap().into_inner();
-    let metadata_only = Cell::new(true);
 
-    assert!(open_archive(Cursor::new(bytes), &metadata_only, 4096).is_err());
-    assert!(metadata_only.get(), "failed indexing must not enable payload access");
+    assert!(open_archive(Cursor::new(bytes), 4096).is_err());
 }
 
 #[test]
@@ -845,9 +854,8 @@ fn zip64_entry_counts_remain_supported_and_bounded() {
             writer.start_file(format!("e{index}"), SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
         }
         let bytes = writer.finish().unwrap().into_inner();
-        let metadata_only = Cell::new(true);
 
-        let mut archive = open_archive(Cursor::new(bytes), &metadata_only, MAX_ZIP_METADATA_BYTES).unwrap();
+        let mut archive = open_archive(Cursor::new(bytes), MAX_ZIP_METADATA_BYTES).unwrap();
         let result = check_archive(&mut archive, 0);
 
         assert_eq!(archive.len(), count);

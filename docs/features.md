@@ -16,7 +16,7 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   stroke and keep the size; save your own brushes there too.
 - **Tools:** paint, eraser, **projection** with image stencils (hold S to move, turn and scale the
   stencil), polygon fill (triangle, UV island or the whole mesh), **path** and **lasso fill**, a
-  **particle brush**, **smudge**, **clone** (V + click sets the source), color picker, Shift+click
+  **particle brush**, **smudge**, **clone** (V + click sets the source), material picker, Shift+click
   straight lines, and painting directly in the **2D UV view**.
 - **Geometry decals:** drop an image on the surface, then move, scale and turn its frame; it stays
   an editable fill layer.
@@ -80,7 +80,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
 - **Open** glTF/GLB, FBX (binary and ASCII), COLLADA, **USD** (usda, usdc, usdz), **Alembic**,
   OBJ, PLY and STL, or a built-in mesh; UVs are generated when a mesh has none. A `.gltf`'s buffers
   and images and a loose USD layer's textures are read from its folder and kept in the project.
-  Reimport a changed mesh and your painted strokes stay on the surface.
+  Reimport a changed mesh and your painted strokes stay on the surface. The
+  `file.changeMesh` command (trusted local command API and the control channel) moves the project onto a different mesh file and keeps its layers.
 - **UDIM / UV tiles:** detected on import or switched on later, with a resolution per tile (blurs,
   other filters and height-to-normal slopes keep their size in UV space at any tile resolution)
   and one texture per tile on export (`$udim`).

@@ -1,6 +1,7 @@
 //! One integration-test executable avoids linking the same dependencies for every feature.
 //! Keep feature tests in their own modules; the standalone ui_snapshots.rs target remains available.
 
+mod bake_job_mesh;
 mod bake_mode;
 mod brush_drag;
 mod brush_section_reset;
@@ -14,6 +15,7 @@ mod file_dialogs;
 mod fill_channel_image;
 mod fill_projection_section;
 mod filter_picker;
+mod generator_panel;
 mod history_panel;
 mod layer_clipboard;
 mod layer_rename;
@@ -29,11 +31,13 @@ mod properties_popup;
 mod rail;
 mod shelf_drop;
 mod shelf_hover_preview;
+mod shelf_panel;
 mod shift_lines_2d;
 mod shortcut_keys;
 mod skew_paint;
 mod split_divider;
 mod start_window;
+mod tool_availability;
 mod toolbar;
 
 mod symmetry;
